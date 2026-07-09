@@ -2,6 +2,7 @@ import os
 import ssl
 import sqlite3
 import flet as ft
+import threading
 
 # Bypass SSL certificates
 os.environ['PYTHONHTTPSVERIFY'] = '0'
@@ -23,7 +24,28 @@ def init_database():
         id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER,
         product_name TEXT, qty INTEGER, price REAL,
         FOREIGN KEY(order_id) REFERENCES orders(id))''')
+    c.execute('''CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY, value TEXT)''')
     conn.commit(); conn.close()
+
+init_database()
+
+def get_setting(key, default=None):
+    try:
+        conn = sqlite3.connect("billing_system.db")
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        conn.close()
+        return row[0] if row else default
+    except Exception:
+        return default
+
+def save_setting(key, value):
+    try:
+        conn = sqlite3.connect("billing_system.db")
+        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+        conn.commit(); conn.close()
+    except Exception:
+        pass
 
 init_database()
 
@@ -79,6 +101,82 @@ def get_order_items(oid):
     rows = conn.execute("SELECT product_name, qty, price FROM order_items WHERE order_id=?", (oid,)).fetchall()
     conn.close(); return rows
 
+def print_via_bluetooth(receipt_text):
+    # 1. Check if running on Android. If testing on Web/PC, print to local console and mock success.
+    import os
+    is_android = os.environ.get("ANDROID_ARGUMENT") is not None or os.environ.get("ANDROID_PRIVATE") is not None
+    if not is_android:
+        print("\n=== MOCK BLUETOOTH PRINT ===")
+        print(receipt_text)
+        print("============================\n")
+        return True, "Mock printed successfully (Not on Android)"
+
+    try:
+        from jnius import autoclass
+        from java.util import UUID
+        
+        BluetoothAdapter = autoclass('android.bluetooth.BluetoothAdapter')
+        adapter = BluetoothAdapter.getDefaultAdapter()
+        if not adapter:
+            return False, "Bluetooth adapter not found"
+        if not adapter.isEnabled():
+            return False, "Bluetooth is turned off"
+
+        devices = adapter.getBondedDevices().toArray()
+        printer_device = None
+        
+        # Look for typical printer names
+        for d in devices:
+            name = d.getName().lower()
+            if any(keyword in name for keyword in ["print", "mpt", "pos", "thermal", "rpp"]):
+                printer_device = d
+                break
+            
+        if not printer_device:
+            return False, "No paired Bluetooth printer found (make sure printer name contains POS, Print, or Thermal)"
+
+        # Standard UUID for SPP (Serial Port Profile) Bluetooth printers
+        spp_uuid = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
+        socket = printer_device.createRfcommSocketToServiceRecord(spp_uuid)
+        socket.connect()
+        
+        out_stream = socket.getOutputStream()
+        # Initialize printer
+        out_stream.write(bytes([27, 64])) 
+        # Send raw receipt text
+        out_stream.write(receipt_text.encode('utf-8'))
+        # Feed line and cut
+        out_stream.write(bytes([10, 10, 10, 29, 86, 48]))
+        out_stream.flush()
+        socket.close()
+        return True, "Printed successfully!"
+    except Exception as e:
+        return False, f"Print error: {str(e)}"
+
+def check_bluetooth_printer():
+    import os
+    is_android = os.environ.get("ANDROID_ARGUMENT") is not None or os.environ.get("ANDROID_PRIVATE") is not None
+    if not is_android:
+        return True, "Mock Printer"
+
+    try:
+        from jnius import autoclass
+        BluetoothAdapter = autoclass('android.bluetooth.BluetoothAdapter')
+        adapter = BluetoothAdapter.getDefaultAdapter()
+        if not adapter:
+            return False, "Bluetooth adapter not found"
+        if not adapter.isEnabled():
+            return False, "Bluetooth is turned off"
+
+        devices = adapter.getBondedDevices().toArray()
+        for d in devices:
+            name = d.getName().lower()
+            if any(keyword in name for keyword in ["print", "mpt", "pos", "thermal", "rpp"]):
+                return True, "Printer found"
+            
+        return False, "No paired Bluetooth printer found (make sure printer name contains POS, Print, or Thermal)"
+    except Exception as e:
+        return False, f"Bluetooth check error: {str(e)}"
 
 # ── APP ───────────────────────────────────────────────────────────────────────
 def main(page: ft.Page):
@@ -90,10 +188,37 @@ def main(page: ft.Page):
     active_bill_items = []
     products_map = {}
 
+    # Define on_product_change
+    def on_product_change(e):
+        sid = product_dropdown.value
+        if sid == "ADD_NEW_PROD":
+            product_dropdown.value = None
+            show_quick_add_dialog()
+        elif sid:
+            # Look up product by string key in products_map
+            sid_str = str(sid)
+            if sid_str in products_map:
+                price_input.value = f"{products_map[sid_str]['price']:.2f}"
+                price_input.update()
+
     # ── CONTROLS ──────────────────────────────────────────────────────────────
+    saved_shop_name = get_setting("shop_name", "My Store")
+    shop_name_input = ft.TextField(
+        label="Shop Name", 
+        value=saved_shop_name, 
+        border_radius=8, 
+        expand=True
+    )
+    
+    def on_shop_name_change(e):
+        save_setting("shop_name", shop_name_input.value.strip())
+        
+    shop_name_input.on_change = on_shop_name_change
+
     customer_input   = ft.TextField(label="Customer Name", value="Walk-in Customer",
                                     border_radius=8, expand=True)
     product_dropdown = ft.Dropdown(label="Select Product", border_radius=8, expand=True)
+    product_dropdown.on_select = on_product_change
     price_input      = ft.TextField(label="Price (₹)", value="0.00", width=110,
                                     keyboard_type=ft.KeyboardType.NUMBER, border_radius=8,
                                     input_filter=ft.InputFilter(regex_string=r"[0-9.]", allow=True))
@@ -194,16 +319,16 @@ def main(page: ft.Page):
         page.update()
 
     # ── HANDLERS ──────────────────────────────────────────────────────────────
-    def on_product_change(e):
-        sid = product_dropdown.value
-        if sid == "ADD_NEW_PROD":
-            product_dropdown.value = None
-            show_quick_add_dialog()
-        elif sid and sid in products_map:
-            price_input.value = f"{products_map[sid]['price']:.2f}"
-            page.update()
+    # def on_product_change(e):
+    #     sid = product_dropdown.value
+    #     if sid == "ADD_NEW_PROD":
+    #         product_dropdown.value = None
+    #         show_quick_add_dialog()
+    #     elif sid and sid in products_map:
+    #         price_input.value = f"{products_map[sid]['price']:.2f}"
+    #         page.update()
 
-    product_dropdown.on_change = on_product_change
+    # product_dropdown.on_change = on_product_change
 
     def add_to_bill(e):
         sid = product_dropdown.value
@@ -229,15 +354,81 @@ def main(page: ft.Page):
         qty_input.value = "1"; price_input.value = "0.00"; product_dropdown.value = None
         update_bill_table()
 
-    def save_bill(e):
+    def generate_receipt_text(shop_name, items):
+        # 32 columns standard for 58mm thermal printers
+        receipt = []
+        receipt.append(f"{shop_name.center(32)}\n")
+        receipt.append("-" * 32 + "\n")
+        
+        total_qty = 0
+        grand_total = 0.0
+        
+        for item in items:
+            name = item['name']
+            qty = item['qty']
+            price = item['price']
+            total = item['total']
+            total_qty += qty
+            grand_total += total
+            
+            # Print item name on its own line if long, or fit it
+            receipt.append(f"{name}\n")
+            # Layout line: Qty x Price = Total
+            line_details = f"  {qty} x Rs.{price:.2f}"
+            total_str = f"Rs.{total:.2f}"
+            spaces = 32 - len(line_details) - len(total_str)
+            receipt.append(f"{line_details}{' ' * max(1, spaces)}{total_str}\n")
+            
+        receipt.append("-" * 32 + "\n")
+        
+        # Totals
+        qty_line = f"Total Qty: {total_qty}"
+        total_line = f"Grand Total: Rs.{grand_total:.2f}"
+        receipt.append(f"{qty_line}\n")
+        receipt.append(f"{total_line}\n")
+        receipt.append("-" * 32 + "\n")
+        receipt.append(f"{'Thank you!'.center(32)}\n")
+        return "".join(receipt)
+
+    def save_and_print_bill(e):
         if not active_bill_items:
             billing_status.value = "❌ Add at least one item first."; billing_status.color = "red700"; page.update(); return
+            
+        shop_name = shop_name_input.value.strip() or "My Store"
         cust = customer_input.value.strip() or "Walk-in Customer"
         total = sum(i['total'] for i in active_bill_items)
+        
+        # Check printer status synchronously first
+        printer_ok, printer_msg = check_bluetooth_printer()
+        
+        # Generate receipt text before clearing items
+        receipt_text = generate_receipt_text(shop_name, active_bill_items)
+        
+        # Save to database
         oid = save_order(cust, active_bill_items, total)
         active_bill_items.clear(); customer_input.value = "Walk-in Customer"
-        billing_status.value = f"✅ Order #{oid} saved!"; billing_status.color = "green700"
+        
+        # If no printer is connected, update UI to warning instantly
+        if not printer_ok:
+            billing_status.value = f"⚠️ Order #{oid} saved but Print Failed: {printer_msg}"
+            billing_status.color = "orange700"
+            update_bill_table()
+            return
+            
+        # If printer exists, set status to printing and start printing thread
+        billing_status.value = f"✅ Order #{oid} saved! Printing..."; billing_status.color = "blue700"
         update_bill_table()
+        
+        # Print using Bluetooth in background thread so the app UI does not freeze
+        def run_printing():
+            ok, msg = print_via_bluetooth(receipt_text)
+            if ok:
+                billing_status.value = f"✅ Order #{oid} saved & Printed!"; billing_status.color = "green700"
+            else:
+                billing_status.value = f"⚠️ Order #{oid} saved but Print Failed: {msg}"; billing_status.color = "orange700"
+            page.update()
+            
+        threading.Thread(target=run_printing, daemon=True).start()
 
     def add_product_action(e):
         name = prod_name_input.value.strip()
@@ -337,7 +528,7 @@ def main(page: ft.Page):
     # ── TAB PAGE CONTENTS ─────────────────────────────────────────────────────
     billing_page = ft.Column([
         ft.Text("Create New Invoice", size=20, weight=ft.FontWeight.BOLD, color="blue800"),
-        customer_input,
+        ft.Row([shop_name_input, customer_input], spacing=8),
         ft.Divider(),
         ft.Row([product_dropdown], spacing=0),
         ft.Row([price_input, qty_input,
@@ -349,9 +540,9 @@ def main(page: ft.Page):
         ft.Text("Active Bill Items", size=16, weight=ft.FontWeight.BOLD),
         table_card(bill_table),
         ft.Row([total_text,
-                ft.FilledButton("Save & Close Invoice", icon=ft.Icons.SAVE,
+                ft.FilledButton("Print & Save Invoice", icon=ft.Icons.PRINT,
                                 bgcolor="green700", color="white",
-                                on_click=save_bill, height=48)],
+                                on_click=save_and_print_bill, height=48)],
                alignment=ft.MainAxisAlignment.SPACE_BETWEEN, wrap=True),
     ], spacing=14, scroll=ft.ScrollMode.AUTO)
 
