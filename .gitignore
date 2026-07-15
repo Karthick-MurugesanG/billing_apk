@@ -6,6 +6,9 @@ __pycache__/
 # C extensions
 *.so
 
+#The Kivy framework build apk
+.buildozer
+
 # Distribution / packaging
 bin/
 build/
